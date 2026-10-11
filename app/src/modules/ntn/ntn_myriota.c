@@ -5,6 +5,7 @@
  */
 
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,12 +14,18 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/smf.h>
+#include <zephyr/sys/timeutil.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/task_wdt/task_wdt.h>
 #include <zephyr/zbus/zbus.h>
 #include <date_time.h>
 #include <hyperpulse_lib.h>
+#include <nrf_modem_at.h>
 #include <nrf_modem_gnss.h>
+
+#if defined(CONFIG_APP_NTN_SENML_PAYLOAD)
+#include <zcbor_encode.h>
+#endif
 
 #include "app_common.h"
 #include "button.h"
@@ -133,6 +140,88 @@ static void publish_last_pvt(const struct nrf_modem_gnss_pvt_data_frame *pvt)
 		LOG_ERR("Failed to publish last PVT message, error: %d", err);
 	}
 }
+
+#if defined(CONFIG_APP_NTN_THINGY_ROCKS_ENDPOINT)
+/* Link statistics for the thingy.rocks payload.
+ *
+ * The HyperPulse library owns the modem AT notification handler, so the handler registration is
+ * wrapped at link time (-Wl,--wrap=nrf_modem_at_notif_handler_set, see CMakeLists.txt) to tap
+ * notifications before they are passed on to the library unchanged. The library enables
+ * AT%CESQ=1 and AT+CEREG=5 itself.
+ *
+ * AT#MSEND only queues the uplink, which is sent on the next RRC connection, so a payload always
+ * carries the statistics of the previous connection.
+ */
+#define LINK_STAT_UNKNOWN		-1
+#define CESQ_RSRP_UNKNOWN		255
+#define CEREG_STAT_HOME			1
+#define CEREG_STAT_SEARCHING		2
+#define CEREG_STAT_ROAMING		5
+
+/* RSRP index as reported by %CESQ: dBm = index - 140 */
+static atomic_t link_rsrp_index = ATOMIC_INIT(LINK_STAT_UNKNOWN);
+/* Time from "UE trying to attach" (+CEREG: 2) to registered (+CEREG: 1/5) */
+static atomic_t link_attach_latency_ms = ATOMIC_INIT(LINK_STAT_UNKNOWN);
+static atomic_t link_attach_start_ms;
+
+static nrf_modem_at_notif_handler_t lib_notif_handler;
+
+#if defined(CONFIG_APP_NTN_THINGY_ROCKS_REFRESH_ON_FIRST_ATTACH)
+/* Delay after registration so the first %CESQ of the connection can arrive */
+#define LINK_STATS_REFRESH_DELAY_MS	2000
+
+static void link_stats_refresh_work_fn(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(link_stats_refresh_work, link_stats_refresh_work_fn);
+static atomic_t link_stats_refresh_done;
+#endif
+
+int __real_nrf_modem_at_notif_handler_set(nrf_modem_at_notif_handler_t callback);
+
+/* Runs in ISR context, keep it short */
+static void link_stats_notif_tap(const char *notif)
+{
+	if (strncmp(notif, "%CESQ: ", 7) == 0) {
+		long rsrp = strtol(notif + 7, NULL, 10);
+
+		if (rsrp >= 0 && rsrp < CESQ_RSRP_UNKNOWN) {
+			atomic_set(&link_rsrp_index, rsrp);
+		}
+	} else if (strncmp(notif, "+CEREG: ", 8) == 0) {
+		long stat = strtol(notif + 8, NULL, 10);
+		uint32_t now = k_uptime_get_32();
+
+		if (stat == CEREG_STAT_SEARCHING) {
+			/* Keep the first "searching" report of an attach attempt */
+			atomic_cas(&link_attach_start_ms, 0, now ? now : 1);
+		} else if (stat == CEREG_STAT_HOME || stat == CEREG_STAT_ROAMING) {
+			uint32_t start = atomic_set(&link_attach_start_ms, 0);
+
+			if (start != 0) {
+				atomic_set(&link_attach_latency_ms, now - start);
+#if defined(CONFIG_APP_NTN_THINGY_ROCKS_REFRESH_ON_FIRST_ATTACH)
+				if (atomic_cas(&link_stats_refresh_done, 0, 1)) {
+					k_work_schedule(&link_stats_refresh_work,
+							K_MSEC(LINK_STATS_REFRESH_DELAY_MS));
+				}
+#endif
+			}
+		} else {
+			atomic_set(&link_attach_start_ms, 0);
+		}
+	}
+
+	if (lib_notif_handler) {
+		lib_notif_handler(notif);
+	}
+}
+
+int __wrap_nrf_modem_at_notif_handler_set(nrf_modem_at_notif_handler_t callback)
+{
+	lib_notif_handler = callback;
+
+	return __real_nrf_modem_at_notif_handler_set(callback ? link_stats_notif_tap : NULL);
+}
+#endif /* CONFIG_APP_NTN_THINGY_ROCKS_ENDPOINT */
 
 static void apply_gnss_time(const struct nrf_modem_gnss_pvt_data_frame *pvt_data)
 {
@@ -266,14 +355,16 @@ static int myriota_request_gnss_location(void)
 static int myriota_parse_location_response(const char *response,
 					   struct nrf_modem_gnss_pvt_data_frame *pvt)
 {
-	int acc, lat, lon, elev;
+	int method, lat, lon, elev;
 	time_t timestamp;
+	struct nrf_modem_gnss_pvt_data_frame modem_pvt;
 
 	if (!response || !pvt || strncmp(response, "#MLOCATION:", 11) != 0) {
 		return -EINVAL;
 	}
 
-	if (sscanf(response, "#MLOCATION: %d,%d,%d,%d,%jd,", &acc, &lat, &lon, &elev,
+	/* #MLOCATION: <method>,<lat>,<lon>,<elev>,<timestamp_s>, carries no accuracy */
+	if (sscanf(response, "#MLOCATION: %d,%d,%d,%d,%jd,", &method, &lat, &lon, &elev,
 		   &timestamp) != 5) {
 		return -EINVAL;
 	}
@@ -282,8 +373,17 @@ static int myriota_parse_location_response(const char *response,
 	pvt->latitude = (double)lat / 1e7;
 	pvt->longitude = (double)lon / 1e7;
 	pvt->altitude = (float)elev / 1000.0f;
-	pvt->accuracy = (float)acc;
 	pvt->flags |= NRF_MODEM_GNSS_PVT_FLAG_FIX_VALID;
+
+	/* Take the accuracy from the modem's latest PVT frame, if it is the same fix */
+	if (nrf_modem_gnss_read(&modem_pvt, sizeof(modem_pvt), NRF_MODEM_GNSS_DATA_PVT) == 0 &&
+	    (modem_pvt.flags & NRF_MODEM_GNSS_PVT_FLAG_FIX_VALID) &&
+	    fabs(modem_pvt.latitude - pvt->latitude) < 1e-4 &&
+	    fabs(modem_pvt.longitude - pvt->longitude) < 1e-4) {
+		pvt->accuracy = modem_pvt.accuracy;
+	} else {
+		LOG_WRN("GNSS accuracy not available");
+	}
 
 	if (timestamp > 0) {
 		struct tm gnss_time;
@@ -297,14 +397,133 @@ static int myriota_parse_location_response(const char *response,
 		pvt->datetime.seconds = gnss_time.tm_sec;
 	}
 
-	LOG_INF("GNSS fix: lat=%.6f lon=%.6f alt=%.1f acc=%d",
-		pvt->latitude, pvt->longitude, (double)pvt->altitude, acc);
+	LOG_INF("GNSS fix: lat=%.6f lon=%.6f alt=%.1f acc=%.1f method=%d",
+		pvt->latitude, pvt->longitude, (double)pvt->altitude,
+		(double)pvt->accuracy, method);
 
 	return 0;
 }
 
-static int myriota_format_payload(struct ntn_state_object *state, char *message, size_t message_len)
+#if defined(CONFIG_APP_NTN_SENML_PAYLOAD)
+/* SenML CBOR labels (RFC 8428 section 6), encoded as text strings because
+ * world.thingy.rocks decodes integer-keyed maps into empty records.
+ */
+#define SENML_LABEL_BASE_NAME	"-2"
+#define SENML_LABEL_BASE_TIME	"-3"
+#define SENML_LABEL_NAME	"0"
+#define SENML_LABEL_VALUE	"2"
+#define SENML_LABEL_STRING_VALUE "3"
+
+/* Max number of records (one map per resource) in the SenML pack */
+#define SENML_MAX_RECORDS	8
+
+static bool senml_record_float(zcbor_state_t *zse, const char *base_name, const int64_t *base_time,
+			       const char *name, double value, bool full_precision)
 {
+	size_t entries = 2 + (base_name ? 1 : 0) + (base_time ? 1 : 0);
+	bool ok = zcbor_map_start_encode(zse, entries);
+
+	if (base_name) {
+		ok = ok && zcbor_tstr_put_lit(zse, SENML_LABEL_BASE_NAME) &&
+		     zcbor_tstr_put_term(zse, base_name, SIZE_MAX);
+	}
+
+	if (base_time) {
+		ok = ok && zcbor_tstr_put_lit(zse, SENML_LABEL_BASE_TIME) &&
+		     zcbor_int64_put(zse, *base_time);
+	}
+
+	ok = ok && zcbor_tstr_put_lit(zse, SENML_LABEL_NAME) &&
+	     zcbor_tstr_put_term(zse, name, SIZE_MAX) &&
+	     zcbor_tstr_put_lit(zse, SENML_LABEL_VALUE);
+
+	if (full_precision) {
+		ok = ok && zcbor_float64_put(zse, value);
+	} else {
+		ok = ok && zcbor_float32_put(zse, (float)value);
+	}
+
+	return ok && zcbor_map_end_encode(zse, entries);
+}
+
+/* [IMEI, [SenML records]] in CBOR, as expected by world.thingy.rocks (UDP port 6667 format).
+ * The records carry LwM2M objects, see https://github.com/hello-nrfcloud/proto-map
+ */
+static int myriota_format_senml_payload(struct ntn_state_object *state, uint8_t *payload,
+					size_t payload_size, size_t *payload_len)
+{
+	bool ok;
+	int64_t timestamp;
+	char imei[16] = {0};
+	char temp[16] = {0};
+	struct tm fix_time = {
+		.tm_year = state->last_pvt.datetime.year - 1900,
+		.tm_mon = state->last_pvt.datetime.month - 1,
+		.tm_mday = state->last_pvt.datetime.day,
+		.tm_hour = state->last_pvt.datetime.hour,
+		.tm_min = state->last_pvt.datetime.minute,
+		.tm_sec = state->last_pvt.datetime.seconds,
+	};
+
+	ZCBOR_STATE_E(zse, 3, payload, payload_size, 1);
+
+	/* world.thingy.rocks identifies the device by its full IMEI */
+	if (myriota_get_imei(imei, sizeof(imei)) < 0) {
+		LOG_WRN("No IMEI for SenML payload");
+		return -ENODATA;
+	}
+
+	/* Base time is mandatory. Prefer the GNSS fix time, fall back to system time. */
+	if (state->last_pvt.datetime.year >= 2000) {
+		timestamp = timeutil_timegm64(&fix_time);
+	} else if (date_time_now(&timestamp) == 0) {
+		timestamp /= MSEC_PER_SEC;
+	} else {
+		LOG_WRN("No valid time for SenML payload");
+		return -ENODATA;
+	}
+
+	ok = zcbor_list_start_encode(zse, 2) && zcbor_tstr_put_term(zse, imei, sizeof(imei)) &&
+	     zcbor_list_start_encode(zse, SENML_MAX_RECORDS);
+
+	/* Geolocation (14201) */
+	ok = ok && senml_record_float(zse, "14201/0/", &timestamp, "0",
+				      state->last_pvt.latitude, true);
+	ok = ok && senml_record_float(zse, NULL, NULL, "1", state->last_pvt.longitude, true);
+	ok = ok && senml_record_float(zse, NULL, NULL, "2",
+				      (double)state->last_pvt.altitude, false);
+	ok = ok && senml_record_float(zse, NULL, NULL, "3",
+				      (double)state->last_pvt.accuracy, false);
+	ok = ok && zcbor_map_start_encode(zse, 2) &&
+	     zcbor_tstr_put_lit(zse, SENML_LABEL_NAME) && zcbor_tstr_put_lit(zse, "6") &&
+	     zcbor_tstr_put_lit(zse, SENML_LABEL_STRING_VALUE) && zcbor_tstr_put_lit(zse, "GNSS") &&
+	     zcbor_map_end_encode(zse, 2);
+
+	/* Environment (14205), reuses the base time set above */
+	if (myriota_get_temperature(temp, sizeof(temp)) == 0) {
+		ok = ok && senml_record_float(zse, "14205/0/", NULL, "0", atoi(temp), false);
+	}
+
+	ok = ok && zcbor_list_end_encode(zse, SENML_MAX_RECORDS) && zcbor_list_end_encode(zse, 2);
+	if (!ok) {
+		LOG_ERR("SenML CBOR encoding failed: %d", zcbor_peek_error(zse));
+		return -ENOBUFS;
+	}
+
+	*payload_len = zse->payload - payload;
+
+	return 0;
+}
+#endif /* CONFIG_APP_NTN_SENML_PAYLOAD */
+
+static int myriota_format_payload(struct ntn_state_object *state, uint8_t *payload,
+				  size_t payload_size, size_t *payload_len)
+{
+#if defined(CONFIG_APP_NTN_SENML_PAYLOAD)
+	return myriota_format_senml_payload(state, payload, payload_size, payload_len);
+#else
+	char *message = (char *)payload;
+	size_t message_len = payload_size;
 	int err;
 	char temp[16] = {0};
 	char imei[16] = {0};
@@ -329,20 +548,36 @@ static int myriota_format_payload(struct ntn_state_object *state, char *message,
 	}
 
 #if defined(CONFIG_APP_NTN_THINGY_ROCKS_ENDPOINT)
-	// imei,ping_rtt,rsrp,band,ue_mode,oper,lat_str,lon_str,accuracy,...
-	// ...battery_str,temp_str,pressure_str,humidity_str
+	/* world.thingy.rocks UDP format (port 6666):
+	 * imei,ts,ping,rsrp,band,ue_mode,operator,lat,lon,accuracy,battery,temp,pressure,humidity
+	 * ts is left empty (receive time is used). Unknown ping/rsrp are left empty.
+	 * rsrp is the %CESQ index (dBm + 140). Band 255 is the NTN band locked by HyperPulse.
+	 */
+	char ping[12] = "";
+	char rsrp[12] = "";
+	atomic_val_t latency_ms = atomic_get(&link_attach_latency_ms);
+	atomic_val_t rsrp_index = atomic_get(&link_rsrp_index);
+
+	if (latency_ms != LINK_STAT_UNKNOWN) {
+		snprintk(ping, sizeof(ping), "%ld", (long)latency_ms);
+	}
+
+	if (rsrp_index != LINK_STAT_UNKNOWN) {
+		snprintk(rsrp, sizeof(rsrp), "%ld", (long)rsrp_index);
+	}
+
 	err = snprintk(message, message_len,
-		       "%s,,%d,%s,%s,%s,%s,%.3f,%.3f,%d,%.1f,%s,%s,%s",
+		       "%s,,%s,%s,%s,%s,%s,%.6f,%.6f,%d,%.1f,%s,%s,%s",
 		       imei,
-			-1,
-			"139",
-			"0",
-			"0",
-			"90129",
-			state->last_pvt.latitude,
-			state->last_pvt.longitude,
-			(int)state->last_pvt.accuracy,
-			99.9, temp, "999.99", "99.99");
+		       ping,
+		       rsrp,
+		       "255",
+		       "0",
+		       "90129",
+		       state->last_pvt.latitude,
+		       state->last_pvt.longitude,
+		       (int)state->last_pvt.accuracy,
+		       99.9, temp, "999.99", "99.99");
 #elif defined(CONFIG_APP_NTN_SEND_GNSS_DATA)
 	err = snprintk(message, message_len,
 		       "Device: *%s, temp: %s, lat=%.2f, lon=%.2f, alt=%.2f, "
@@ -361,12 +596,15 @@ static int myriota_format_payload(struct ntn_state_object *state, char *message,
 		return -EINVAL;
 	}
 
+	*payload_len = err;
+
 	return 0;
+#endif /* CONFIG_APP_NTN_SENML_PAYLOAD */
 }
 
 static int myriota_send_payload(struct ntn_state_object *state)
 {
-	char message[HYPERPULSE_UPLINK_MAX_LEN + 1];
+	uint8_t message[HYPERPULSE_UPLINK_MAX_LEN + 1];
 	char hex_string[(HYPERPULSE_UPLINK_MAX_LEN * 2) + 1];
 	char command[HYPERPULSE_AT_RESPONSE_LEN];
 	size_t msg_len;
@@ -377,12 +615,11 @@ static int myriota_send_payload(struct ntn_state_object *state)
 		return -EINVAL;
 	}
 
-	err = myriota_format_payload(state, message, sizeof(message));
+	err = myriota_format_payload(state, message, sizeof(message), &msg_len);
 	if (err) {
 		return err;
 	}
 
-	msg_len = strlen(message);
 	if (msg_len > HYPERPULSE_UPLINK_MAX_LEN) {
 		return -ENOBUFS;
 	}
@@ -392,7 +629,11 @@ static int myriota_send_payload(struct ntn_state_object *state)
 
 	snprintk(command, sizeof(command), "AT#MSEND=%zu,\"%s\"", msg_len, hex_string);
 
-	LOG_INF("Scheduling uplink: %s", message);
+#if defined(CONFIG_APP_NTN_SENML_PAYLOAD)
+	LOG_INF("Scheduling SenML CBOR uplink (%zu bytes): %s", msg_len, hex_string);
+#else
+	LOG_INF("Scheduling uplink: %.*s", (int)msg_len, (char *)message);
+#endif
 
 	return hyperpulse_send_at_check_ok(command);
 }
@@ -440,6 +681,29 @@ static void ntn_send_timeout_work_fn(struct k_work *work)
 	LOG_WRN("Myriota uplink timed out");
 	ntn_msg_publish(NTN_SEND_FAILED);
 }
+
+#if defined(CONFIG_APP_NTN_THINGY_ROCKS_REFRESH_ON_FIRST_ATTACH)
+/* The uplink queued before the first attach has no link statistics. Queue one more right after
+ * the first registration, so it can go out in the same connection with the fresh values.
+ */
+static void link_stats_refresh_work_fn(struct k_work *work)
+{
+	int err;
+
+	ARG_UNUSED(work);
+
+	if (!active_state) {
+		return;
+	}
+
+	LOG_INF("First attach done, queuing uplink with link statistics");
+
+	err = myriota_send_payload(active_state);
+	if (err) {
+		LOG_WRN("Failed to queue uplink with link statistics, error: %d", err);
+	}
+}
+#endif
 
 static void ntn_send_work_fn(struct k_work *work)
 {

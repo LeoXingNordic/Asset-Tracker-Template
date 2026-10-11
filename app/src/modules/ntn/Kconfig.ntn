@@ -118,10 +118,31 @@ config APP_NTN_MSG_PROCESSING_TIMEOUT_SECONDS
 	  Maximum time allowed for processing a single message in the NTN module.
 	  Must be less than APP_NTN_WATCHDOG_TIMEOUT_SECONDS.
 
+config APP_NTN_SENML_PAYLOAD
+	bool "Encode uplink payload as LwM2M objects in SenML CBOR"
+	depends on APP_NTN_BACKEND_MYRIOTA
+	select ZCBOR
+	select ZCBOR_CANONICAL
+	help
+	  Encode the uplink payload as LwM2M objects in SenML CBOR (RFC 8428), as defined by
+	  https://github.com/hello-nrfcloud/proto-map. Sends Geolocation (14201)
+	  and Environment (14205) objects. Takes precedence over
+	  APP_NTN_THINGY_ROCKS_ENDPOINT and APP_NTN_SEND_GNSS_DATA.
+
 config APP_NTN_THINGY_ROCKS_ENDPOINT
 	bool "Use world.thingy.rocks endpoint"
 	help
 	  Use world.thingy.rocks endpoint.
+
+config APP_NTN_THINGY_ROCKS_REFRESH_ON_FIRST_ATTACH
+	bool "Queue an extra uplink with link statistics after the first attach"
+	depends on APP_NTN_THINGY_ROCKS_ENDPOINT && APP_NTN_BACKEND_MYRIOTA
+	default y
+	help
+	  An uplink is queued before the modem attaches, so the first uplink after boot has no
+	  RSRP or latency. With this option, one more uplink is queued right after the first
+	  registration, so the fresh values can be sent in the same satellite connection.
+	  Costs one extra uplink per boot.
 
 config APP_NTN_IRIDIUM
 	bool "Iridium network"
