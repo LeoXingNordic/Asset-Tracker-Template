@@ -26,6 +26,12 @@
 #include "app_common.h"
 #include "ntn.h"
 #include "button.h"
+#if defined(CONFIG_APP_POWER)
+#include "power.h"
+#endif /* CONFIG_APP_POWER */
+#if defined(CONFIG_APP_LED)
+#include "led.h"
+#endif /* CONFIG_APP_LED */
 
 LOG_MODULE_REGISTER(ntn_module, CONFIG_APP_NTN_LOG_LEVEL);
 
@@ -44,8 +50,15 @@ ZBUS_MSG_SUBSCRIBER_DEFINE(ntn);
 /* Observe NTN channel */
 ZBUS_CHAN_ADD_OBS(NTN_CHAN, ntn, 0);
 ZBUS_CHAN_ADD_OBS(BUTTON_CHAN, ntn, 0);
+#if defined(CONFIG_APP_POWER)
+ZBUS_CHAN_ADD_OBS(POWER_CHAN, ntn, 0);
+#endif /* CONFIG_APP_POWER */
 
+#if defined(CONFIG_APP_POWER)
+#define MAX_MSG_SIZE MAX(sizeof(struct ntn_msg), sizeof(struct power_msg))
+#else
 #define MAX_MSG_SIZE sizeof(struct ntn_msg)
+#endif
 
 /* State machine states */
 enum ntn_module_state {
@@ -64,6 +77,8 @@ struct ntn_state_object {
 	struct k_timer network_connection_timer;
 	struct nrf_modem_gnss_pvt_data_frame last_pvt;
 	double elevation;
+	double battery_percentage;
+	bool battery_valid;
 	int sock_fd;
 	uint64_t location_validity_end_time;
 	int64_t  modem_cell_found_time;
@@ -86,6 +101,50 @@ static struct k_work ntn_trigger_timer_work;
 static struct k_work network_connection_timer_work;
 static struct k_work gnss_location_work;
 static struct k_work gnss_timeout_work;
+
+/* Status LED and battery helpers, no-ops when the modules are disabled */
+
+static void led_status_set(uint8_t red, uint8_t green, uint8_t blue,
+			   uint32_t on_msec, uint32_t off_msec, int repetitions)
+{
+#if defined(CONFIG_APP_LED)
+	struct led_msg led_msg = {
+		.type = LED_RGB_SET,
+		.red = red,
+		.green = green,
+		.blue = blue,
+		.duration_on_msec = on_msec,
+		.duration_off_msec = off_msec,
+		.repetitions = repetitions,
+	};
+	int err = zbus_chan_pub(&LED_CHAN, &led_msg, K_SECONDS(1));
+
+	if (err) {
+		LOG_WRN("Failed to publish LED pattern, error: %d", err);
+	}
+#else
+	ARG_UNUSED(red);
+	ARG_UNUSED(green);
+	ARG_UNUSED(blue);
+	ARG_UNUSED(on_msec);
+	ARG_UNUSED(off_msec);
+	ARG_UNUSED(repetitions);
+#endif /* CONFIG_APP_LED */
+}
+
+static void battery_sample_request(void)
+{
+#if defined(CONFIG_APP_POWER)
+	struct power_msg power_msg = {
+		.type = POWER_BATTERY_PERCENTAGE_SAMPLE_REQUEST,
+	};
+	int err = zbus_chan_pub(&POWER_CHAN, &power_msg, K_SECONDS(1));
+
+	if (err) {
+		LOG_WRN("Failed to request battery sample, error: %d", err);
+	}
+#endif /* CONFIG_APP_POWER */
+}
 
 /* Forward declarations */
 
@@ -1101,6 +1160,11 @@ static int sock_send_gnss_data(struct ntn_state_object *state)
 	int32_t packet_delay;
 	char imei_suffix[5];
 	size_t imei_len;
+	char battery[8] = "N/A";
+
+	if (state->battery_valid) {
+		snprintk(battery, sizeof(battery), "%d%%", (int)state->battery_percentage);
+	}
 
 	if (state->sock_fd < 0) {
 		LOG_ERR("Socket not connected");
@@ -1190,9 +1254,9 @@ static int sock_send_gnss_data(struct ntn_state_object *state)
 #elif defined(CONFIG_APP_NTN_SEND_GNSS_DATA)
 	/* Format GNSS data as string */
 	err = snprintk(message, sizeof(message),
-		"Device: *%s, temp: %s, lat=%.2f, lon=%.2f, alt=%.2f, "
+		"Device: *%s, temp: %s, batt: %s, lat=%.2f, lon=%.2f, alt=%.2f, "
 		"time=%04d-%02d-%02d %02d:%02d:%02d",
-		imei_suffix, temp,
+		imei_suffix, temp, battery,
 		(double)state->last_pvt.latitude, (double)state->last_pvt.longitude, (double)state->last_pvt.altitude,
 		state->last_pvt.datetime.year, state->last_pvt.datetime.month, state->last_pvt.datetime.day,
 		state->last_pvt.datetime.hour, state->last_pvt.datetime.minute, state->last_pvt.datetime.seconds);
@@ -1203,8 +1267,8 @@ static int sock_send_gnss_data(struct ntn_state_object *state)
 	}
 #else
 	err = snprintk(message, sizeof(message),
-		       "Device: *%s, temp: %s",
-		       imei_suffix, temp);
+		       "Device: *%s, temp: %s, batt: %s",
+		       imei_suffix, temp, battery);
 	if (err < 0 || err >= sizeof(message)) {
 		LOG_ERR("Failed to format GNSS data, error: %d", err);
 
@@ -1425,6 +1489,18 @@ static enum smf_state_result state_running_run(void *obj)
 
 
 
+#if defined(CONFIG_APP_POWER)
+	} else if (state->chan == &POWER_CHAN) {
+		const struct power_msg *msg = (const struct power_msg *)state->msg_buf;
+
+		if (msg->type == POWER_BATTERY_PERCENTAGE_SAMPLE_RESPONSE) {
+			state->battery_percentage = msg->percentage;
+			state->battery_valid = true;
+			LOG_DBG("Battery: %d%% (%.2f V)", (int)msg->percentage, msg->voltage);
+
+			return SMF_EVENT_HANDLED;
+		}
+#endif /* CONFIG_APP_POWER */
 	} else if (state->chan == &BUTTON_CHAN) {
 		k_timer_start(&state->ntn_trigger_timer,
 			      K_MINUTES(CONFIG_APP_NTN_TIMER_TIMEOUT_MINUTES),
@@ -1443,6 +1519,10 @@ static void state_gnss_entry(void *obj)
 	struct ntn_state_object *state = (struct ntn_state_object *)obj;
 
 	LOG_DBG("%s", __func__);
+
+	/* Blue slow blink: searching for GNSS fix */
+	led_status_set(0, 0, 55, 250, 1000, -1);
+	battery_sample_request();
 
 	/* Close socket if it was open */
 	if (state->sock_fd >= 0) {
@@ -1513,6 +1593,10 @@ static void state_ntn_entry(void *obj)
 	struct ntn_state_object *state = (struct ntn_state_object *)obj;
 
 	LOG_DBG("%s", __func__);
+
+	/* Yellow blink: connecting over NTN */
+	led_status_set(55, 30, 0, 250, 750, -1);
+	battery_sample_request();
 
 	state->pdn_resumed_time = 0;
 	state->modem_cell_found_time = 0;
@@ -1701,6 +1785,9 @@ static enum smf_state_result state_ntn_run(void *obj)
 
 			smf_set_state(SMF_CTX(state), &states[STATE_IDLE]);
 
+			/* Green blinks: uplink acknowledged (after idle entry turned LED off) */
+			led_status_set(0, 55, 0, 250, 250, 6);
+
 			return SMF_EVENT_HANDLED;
 
 		case NTN_SEND_FAILED:
@@ -1709,6 +1796,9 @@ static enum smf_state_result state_ntn_run(void *obj)
 			}
 
 			smf_set_state(SMF_CTX(state), &states[STATE_IDLE]);
+
+			/* Red blinks: uplink failed */
+			led_status_set(55, 0, 0, 250, 250, 6);
 
 			return SMF_EVENT_HANDLED;
 
@@ -1754,6 +1844,9 @@ static void state_idle_entry(void *obj)
 	LOG_DBG("%s", __func__);
 
 	state->rrc_is_connected = false;
+
+	/* LED off while idle to save power */
+	led_status_set(0, 0, 0, 0, 0, 0);
 }
 
 static enum smf_state_result state_idle_run(void *obj)

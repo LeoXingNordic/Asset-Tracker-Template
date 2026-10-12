@@ -61,12 +61,14 @@ west build app -b nrf9151dk/nrf9151/ns -- -DEXTRA_CONF_FILE=overlay-ntn-iridium.
 west build app -b nrf9151dk/nrf9151/ns -- -DEXTRA_CONF_FILE=overlay-ntn-amari.conf
 ```
 
-### NTN Myriota (HyperPulse SIM) - nRF9151 DK
+### NTN Myriota (HyperPulse SIM)
 
 Requires the [Myriota HyperPulse Zephyr module](https://github.com/Myriota/HyperPulse-Zephyr)
 at `modules/lib/myriota-hyperpulse` in your west workspace, NTN modem firmware
 (`mfw_nrf9151-ntn`), and a programmed `network_info.hex` (merged automatically when
 using sysbuild).
+
+#### nRF9151 DK
 
 ```shell
 west build app -b nrf9151dk/nrf9151/ns --sysbuild -- \
@@ -78,11 +80,13 @@ west build app -b nrf9151dk/nrf9151/ns --sysbuild -- \
 Use `prj-ntn-myriota.conf` instead of the default `prj.conf` — the full ATT config is too
 large to fit alongside the HyperPulse flash partitions (~224 KB overflow).
 
-For the Thingy:91 X, keep the factory bootloader layout (MCUboot + external flash) and use
-the Thingy:91 X specific board overlay and partition file instead:
+#### Thingy:91 X
+
+Keep the factory bootloader layout (MCUboot + external flash) and use the Thingy:91 X specific
+board overlay and partition file instead of the DK ones:
 
 ```shell
-west build app -b thingy91x/nrf9151/ns --sysbuild -d build_thingy91x -- \
+west build app -b thingy91x/nrf9151/ns --sysbuild -p always -d build_thingy91x -- \
   -DCONF_FILE=prj-ntn-myriota.conf \
   -DEXTRA_CONF_FILE="overlay-ntn-myriota.conf;boards/overlay-ntn-myriota-thingy91x.conf" \
   -DPM_STATIC_YML_FILE=pm_static_myriota_thingy91x.yml
@@ -92,7 +96,20 @@ Do not reuse the nRF9151 DK `pm_static_myriota.yml` / `boards/overlay-ntn-myriot
 Thingy:91 X: they shrink the MCUboot partition (MCUboot then overflows its flash region) and
 disable the SPI NOR driver used for the MCUboot secondary slot.
 
-Flash the merged image:
+The Thingy:91 X build also enables the fuel gauge (battery level is sent in the thingy.rocks
+message) and the RGB LED status (blue: GNSS search, yellow: sending, green blinks: uplink
+acknowledged, red blinks: uplink failed). TF-M logging stays enabled on UART0: a TF-M build
+without a secure UART boot-loops on this board.
+
+To debug a boot loop or a fault, add `boards/overlay-ntn-myriota-thingy91x-debug.conf` as the last
+entry of `EXTRA_CONF_FILE`. It enables verbose TF-M logging and fault dumps, and halts at a fault
+instead of resetting:
+
+```shell
+-DEXTRA_CONF_FILE="overlay-ntn-myriota.conf;boards/overlay-ntn-myriota-thingy91x.conf;boards/overlay-ntn-myriota-thingy91x-debug.conf"
+```
+
+Flash the merged image (use `build_thingy91x/` instead of `build/` for the Thingy:91 X build above):
 
 ```shell
 nrfutil device program --firmware build/app_and_network_info_merged.hex --recover
