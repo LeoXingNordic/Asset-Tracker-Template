@@ -78,6 +78,20 @@ west build app -b nrf9151dk/nrf9151/ns --sysbuild -- \
 Use `prj-ntn-myriota.conf` instead of the default `prj.conf` — the full ATT config is too
 large to fit alongside the HyperPulse flash partitions (~224 KB overflow).
 
+For the Thingy:91 X, keep the factory bootloader layout (MCUboot + external flash) and use
+the Thingy:91 X specific board overlay and partition file instead:
+
+```shell
+west build app -b thingy91x/nrf9151/ns --sysbuild -d build_thingy91x -- \
+  -DCONF_FILE=prj-ntn-myriota.conf \
+  -DEXTRA_CONF_FILE="overlay-ntn-myriota.conf;boards/overlay-ntn-myriota-thingy91x.conf" \
+  -DPM_STATIC_YML_FILE=pm_static_myriota_thingy91x.yml
+```
+
+Do not reuse the nRF9151 DK `pm_static_myriota.yml` / `boards/overlay-ntn-myriota.conf` for the
+Thingy:91 X: they shrink the MCUboot partition (MCUboot then overflows its flash region) and
+disable the SPI NOR driver used for the MCUboot secondary slot.
+
 Flash the merged image:
 
 ```shell
